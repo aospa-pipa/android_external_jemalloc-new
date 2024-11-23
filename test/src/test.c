@@ -35,7 +35,7 @@ reentrancy_t_str(reentrancy_t r) {
 }
 
 static void
-do_hook(bool *hook_ran, void (**hook)()) {
+do_hook(bool *hook_ran, void (**hook)(void)) {
 	*hook_ran = true;
 	*hook = NULL;
 
@@ -47,13 +47,13 @@ do_hook(bool *hook_ran, void (**hook)()) {
 }
 
 static void
-libc_reentrancy_hook() {
-	do_hook(&libc_hook_ran, &hooks_libc_hook);
+libc_reentrancy_hook(void) {
+	do_hook(&libc_hook_ran, &test_hooks_libc_hook);
 }
 
 static void
-arena_new_reentrancy_hook() {
-	do_hook(&arena_new_hook_ran, &hooks_arena_new_hook);
+arena_new_reentrancy_hook(void) {
+	do_hook(&arena_new_hook_ran, &test_hooks_arena_new_hook);
 }
 
 /* Actual test infrastructure. */
@@ -87,8 +87,8 @@ test_fail(const char *format, ...) {
 }
 
 static const char *
-test_status_string(test_status_t test_status) {
-	switch (test_status) {
+test_status_string(test_status_t current_status) {
+	switch (current_status) {
 	case test_status_pass: return "pass";
 	case test_status_skip: return "skip";
 	case test_status_fail: return "fail";
@@ -108,6 +108,20 @@ p_test_fini(void) {
 	test_counts[test_status]++;
 	malloc_printf("%s (%s): %s\n", test_name, reentrancy_t_str(reentrancy),
 	    test_status_string(test_status));
+}
+
+static void
+check_global_slow(test_status_t *status) {
+#ifdef JEMALLOC_UNIT_TEST
+	/*
+	 * This check needs to peek into tsd internals, which is why it's only
+	 * exposed in unit tests.
+	 */
+	if (tsd_global_slow()) {
+		malloc_printf("Testing increased global slow count\n");
+		*status = test_status_fail;
+	}
+#endif
 }
 
 static test_status_t
@@ -131,38 +145,47 @@ p_test_impl(bool do_malloc_init, bool do_reentrant, test_t *t, va_list ap) {
 	for (; t != NULL; t = va_arg(ap, test_t *)) {
 		/* Non-reentrant run. */
 		reentrancy = non_reentrant;
-		hooks_arena_new_hook = hooks_libc_hook = NULL;
+		test_hooks_arena_new_hook = test_hooks_libc_hook = NULL;
 		t();
 		if (test_status > ret) {
 			ret = test_status;
 		}
+		check_global_slow(&ret);
 		/* Reentrant run. */
 		if (do_reentrant) {
 			reentrancy = libc_reentrant;
-			hooks_arena_new_hook = NULL;
-			hooks_libc_hook = &libc_reentrancy_hook;
+			test_hooks_arena_new_hook = NULL;
+			test_hooks_libc_hook = &libc_reentrancy_hook;
 			t();
 			if (test_status > ret) {
 				ret = test_status;
 			}
+			check_global_slow(&ret);
 
 			reentrancy = arena_new_reentrant;
-			hooks_libc_hook = NULL;
-			hooks_arena_new_hook = &arena_new_reentrancy_hook;
+			test_hooks_libc_hook = NULL;
+			test_hooks_arena_new_hook = &arena_new_reentrancy_hook;
 			t();
 			if (test_status > ret) {
 				ret = test_status;
 			}
+			check_global_slow(&ret);
 		}
 	}
 
-	malloc_printf("--- %s: %u/%u, %s: %u/%u, %s: %u/%u ---\n",
+	bool colored = test_counts[test_status_fail] != 0 &&
+	    isatty(STDERR_FILENO);
+	const char *color_start = colored ? "\033[1;31m" : "";
+	const char *color_end = colored ? "\033[0m" : "";
+	malloc_printf("%s--- %s: %u/%u, %s: %u/%u, %s: %u/%u ---\n%s",
+	    color_start,
 	    test_status_string(test_status_pass),
 	    test_counts[test_status_pass], test_count,
 	    test_status_string(test_status_skip),
 	    test_counts[test_status_skip], test_count,
 	    test_status_string(test_status_fail),
-	    test_counts[test_status_fail], test_count);
+	    test_counts[test_status_fail], test_count,
+	    color_end);
 
 	return ret;
 }
@@ -211,7 +234,15 @@ p_test_no_malloc_init(test_t *t, ...) {
 }
 
 void
-p_test_fail(const char *prefix, const char *message) {
-	malloc_cprintf(NULL, NULL, "%s%s\n", prefix, message);
+p_test_fail(bool may_abort, const char *prefix, const char *message) {
+	bool colored = test_counts[test_status_fail] != 0 &&
+	    isatty(STDERR_FILENO);
+	const char *color_start = colored ? "\033[1;31m" : "";
+	const char *color_end = colored ? "\033[0m" : "";
+	malloc_cprintf(NULL, NULL, "%s%s%s\n%s", color_start, prefix, message,
+	    color_end);
 	test_status = test_status_fail;
+	if (may_abort) {
+		abort();
+	}
 }

@@ -5,6 +5,7 @@
 #ifdef _WIN32
 #  include <windows.h>
 #  include "msvc_compat/windows_extra.h"
+#  include "msvc_compat/strings.h"
 #  ifdef _WIN64
 #    if LG_VADDR <= 32
 #      error Generate the headers using x64 vcargs
@@ -31,6 +32,13 @@
 #    include <sys/uio.h>
 #  endif
 #  include <pthread.h>
+#  if defined(__FreeBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
+#  include <pthread_np.h>
+#  include <sched.h>
+#  if defined(__FreeBSD__)
+#    define cpu_set_t cpuset_t
+#  endif
+#  endif
 #  include <signal.h>
 #  ifdef JEMALLOC_OS_UNFAIR_LOCK
 #    include <os/lock.h>
@@ -87,5 +95,31 @@ isblank(int c) {
 #  include <unistd.h>
 #endif
 #include <fcntl.h>
+
+/*
+ * The Win32 midl compiler has #define small char; we don't use midl, but
+ * "small" is a nice identifier to have available when talking about size
+ * classes.
+ */
+#ifdef small
+#  undef small
+#endif
+
+/*
+ * Oftentimes we'd like to perform some kind of arithmetic to obtain
+ * a pointer from another pointer but with some offset or mask applied.
+ * Naively you would accomplish this by casting the source pointer to
+ * `uintptr_t`, performing all of the relevant arithmetic, and then casting
+ * the result to the desired pointer type. However, this has the unfortunate
+ * side-effect of concealing pointer provenance, hiding useful information for
+ * optimization from the compiler (see here for details:
+ * https://clang.llvm.org/extra/clang-tidy/checks/performance/no-int-to-ptr.html
+ * )
+ * Instead what one should do is cast the source pointer to `char *` and perform
+ * the equivalent arithmetic (since `char` of course represents one byte). But
+ * because `char *` has the semantic meaning of "string", we define this typedef
+ * simply to make it clearer where we are performing such pointer arithmetic.
+ */
+typedef char byte_t;
 
 #endif /* JEMALLOC_INTERNAL_H */

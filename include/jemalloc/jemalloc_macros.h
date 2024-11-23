@@ -4,12 +4,13 @@
 #include <limits.h>
 #include <strings.h>
 
-#define JEMALLOC_VERSION "5.1.0-0-g61efbda7098de6fe64c362d309824864308c36d4"
+#define JEMALLOC_VERSION "5.3.0-454-g16445c611fbcabc920c617085560a5d2106929ab"
 #define JEMALLOC_VERSION_MAJOR 5
-#define JEMALLOC_VERSION_MINOR 1
+#define JEMALLOC_VERSION_MINOR 3
 #define JEMALLOC_VERSION_BUGFIX 0
-#define JEMALLOC_VERSION_NREV 0
-#define JEMALLOC_VERSION_GID "61efbda7098de6fe64c362d309824864308c36d4"
+#define JEMALLOC_VERSION_NREV 454
+#define JEMALLOC_VERSION_GID "16445c611fbcabc920c617085560a5d2106929ab"
+#define JEMALLOC_VERSION_GID_IDENT 16445c611fbcabc920c617085560a5d2106929ab
 
 #define MALLOCX_LG_ALIGN(la)	((int)(la))
 #if LG_SIZEOF_PTR == 2
@@ -51,7 +52,7 @@
 #define MALLCTL_ARENAS_DESTROYED	4097
 
 #if defined(__cplusplus) && defined(JEMALLOC_USE_CXX_THROW)
-#  define JEMALLOC_CXX_THROW throw()
+#  define JEMALLOC_CXX_THROW noexcept (true)
 #else
 #  define JEMALLOC_CXX_THROW
 #endif
@@ -68,7 +69,9 @@
 #      define JEMALLOC_EXPORT __declspec(dllimport)
 #    endif
 #  endif
+#  define JEMALLOC_FORMAT_ARG(i)
 #  define JEMALLOC_FORMAT_PRINTF(s, i)
+#  define JEMALLOC_FALLTHROUGH
 #  define JEMALLOC_NOINLINE __declspec(noinline)
 #  ifdef __cplusplus
 #    define JEMALLOC_NOTHROW __declspec(nothrow)
@@ -82,6 +85,8 @@
 #  else
 #    define JEMALLOC_ALLOCATOR
 #  endif
+#  define JEMALLOC_COLD
+#  define JEMALLOC_WARN_ON_USAGE(warning_message)
 #elif defined(JEMALLOC_HAVE_ATTR)
 #  define JEMALLOC_ATTR(s) __attribute__((s))
 #  define JEMALLOC_ALIGNED(s) JEMALLOC_ATTR(aligned(s))
@@ -95,6 +100,11 @@
 #  ifndef JEMALLOC_EXPORT
 #    define JEMALLOC_EXPORT JEMALLOC_ATTR(visibility("default"))
 #  endif
+#  ifdef JEMALLOC_HAVE_ATTR_FORMAT_ARG
+#    define JEMALLOC_FORMAT_ARG(i) JEMALLOC_ATTR(__format_arg__(3))
+#  else
+#    define JEMALLOC_FORMAT_ARG(i)
+#  endif
 #  ifdef JEMALLOC_HAVE_ATTR_FORMAT_GNU_PRINTF
 #    define JEMALLOC_FORMAT_PRINTF(s, i) JEMALLOC_ATTR(format(gnu_printf, s, i))
 #  elif defined(JEMALLOC_HAVE_ATTR_FORMAT_PRINTF)
@@ -102,11 +112,26 @@
 #  else
 #    define JEMALLOC_FORMAT_PRINTF(s, i)
 #  endif
+#  ifdef JEMALLOC_HAVE_ATTR_FALLTHROUGH
+#    define JEMALLOC_FALLTHROUGH JEMALLOC_ATTR(fallthrough)
+#  else
+#    define JEMALLOC_FALLTHROUGH
+#  endif
 #  define JEMALLOC_NOINLINE JEMALLOC_ATTR(noinline)
 #  define JEMALLOC_NOTHROW JEMALLOC_ATTR(nothrow)
 #  define JEMALLOC_SECTION(s) JEMALLOC_ATTR(section(s))
 #  define JEMALLOC_RESTRICT_RETURN
 #  define JEMALLOC_ALLOCATOR
+#  ifdef JEMALLOC_HAVE_ATTR_COLD
+#    define JEMALLOC_COLD JEMALLOC_ATTR(__cold__)
+#  else
+#    define JEMALLOC_COLD
+#  endif
+#  ifdef JEMALLOC_HAVE_ATTR_DEPRECATED
+#    define JEMALLOC_WARN_ON_USAGE(warning_message) JEMALLOC_ATTR(deprecated(warning_message))
+#  else
+#    define JEMALLOC_WARN_ON_USAGE(warning_message)
+#  endif
 #else
 #  define JEMALLOC_ATTR(s)
 #  define JEMALLOC_ALIGNED(s)
@@ -114,9 +139,18 @@
 #  define JEMALLOC_ALLOC_SIZE2(s1, s2)
 #  define JEMALLOC_EXPORT
 #  define JEMALLOC_FORMAT_PRINTF(s, i)
+#  define JEMALLOC_FALLTHROUGH
 #  define JEMALLOC_NOINLINE
 #  define JEMALLOC_NOTHROW
 #  define JEMALLOC_SECTION(s)
 #  define JEMALLOC_RESTRICT_RETURN
 #  define JEMALLOC_ALLOCATOR
+#  define JEMALLOC_COLD
+#  define JEMALLOC_WARN_ON_USAGE(warning_message)
+#endif
+
+#if (defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || (defined(__linux__) && !defined(__GLIBC__))) && !defined(JEMALLOC_NO_RENAME)
+#  define JEMALLOC_SYS_NOTHROW
+#else
+#  define JEMALLOC_SYS_NOTHROW JEMALLOC_NOTHROW
 #endif

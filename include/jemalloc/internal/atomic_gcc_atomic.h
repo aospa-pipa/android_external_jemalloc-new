@@ -1,7 +1,10 @@
 #ifndef JEMALLOC_INTERNAL_ATOMIC_GCC_ATOMIC_H
 #define JEMALLOC_INTERNAL_ATOMIC_GCC_ATOMIC_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
 #include "jemalloc/internal/assert.h"
+
+#define ATOMIC_INLINE JEMALLOC_ALWAYS_INLINE
 
 #define ATOMIC_INIT(...) {__VA_ARGS__}
 
@@ -67,7 +70,8 @@ atomic_exchange_##short_type(atomic_##short_type##_t *a, type val,	\
 									\
 ATOMIC_INLINE bool							\
 atomic_compare_exchange_weak_##short_type(atomic_##short_type##_t *a,	\
-    type *expected, type desired, atomic_memory_order_t success_mo,	\
+    UNUSED type *expected, type desired,				\
+    atomic_memory_order_t success_mo,					\
     atomic_memory_order_t failure_mo) {					\
 	return __atomic_compare_exchange(&a->repr, expected, &desired,	\
 	    true, atomic_enum_to_builtin(success_mo),			\
@@ -76,7 +80,8 @@ atomic_compare_exchange_weak_##short_type(atomic_##short_type##_t *a,	\
 									\
 ATOMIC_INLINE bool							\
 atomic_compare_exchange_strong_##short_type(atomic_##short_type##_t *a,	\
-    type *expected, type desired, atomic_memory_order_t success_mo,	\
+    UNUSED type *expected, type desired,				\
+    atomic_memory_order_t success_mo,					\
     atomic_memory_order_t failure_mo) {					\
 	return __atomic_compare_exchange(&a->repr, expected, &desired,	\
 	    false,							\
@@ -123,5 +128,7 @@ atomic_fetch_xor_##short_type(atomic_##short_type##_t *a, type val,	\
 	return __atomic_fetch_xor(&a->repr, val,			\
 	    atomic_enum_to_builtin(mo));				\
 }
+
+#undef ATOMIC_INLINE
 
 #endif /* JEMALLOC_INTERNAL_ATOMIC_GCC_ATOMIC_H */

@@ -5,11 +5,23 @@
 /* Defined if alloc_size attribute is supported. */
 #define JEMALLOC_HAVE_ATTR_ALLOC_SIZE 
 
+/* Defined if format_arg(...) attribute is supported. */
+#define JEMALLOC_HAVE_ATTR_FORMAT_ARG 
+
 /* Defined if format(gnu_printf, ...) attribute is supported. */
 /* #undef JEMALLOC_HAVE_ATTR_FORMAT_GNU_PRINTF */
 
 /* Defined if format(printf, ...) attribute is supported. */
 #define JEMALLOC_HAVE_ATTR_FORMAT_PRINTF 
+
+/* Defined if fallthrough attribute is supported. */
+#define JEMALLOC_HAVE_ATTR_FALLTHROUGH 
+
+/* Defined if cold attribute is supported. */
+#define JEMALLOC_HAVE_ATTR_COLD 
+
+/* Defined if deprecated attribute is supported. */
+#define JEMALLOC_HAVE_ATTR_DEPRECATED 
 
 /*
  * Define overrides for non-standard allocator-related functions if they are
@@ -17,6 +29,7 @@
  */
 #define JEMALLOC_OVERRIDE_MEMALIGN 
 #define JEMALLOC_OVERRIDE_VALLOC 
+/* #undef JEMALLOC_OVERRIDE_PVALLOC */
 
 /*
  * At least Linux omits the "const" in:

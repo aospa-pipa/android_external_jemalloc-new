@@ -1,4 +1,3 @@
-#define JEMALLOC_BASE_C_
 #include "jemalloc/internal/jemalloc_preamble.h"
 #include "jemalloc/internal/jemalloc_internal_includes.h"
 
@@ -12,24 +11,10 @@
 
 static base_t *b0;
 
-metadata_thp_mode_t opt_metadata_thp = METADATA_THP_DEFAULT;
-
-const char *metadata_thp_mode_names[] = {
-	"disabled",
-	"auto",
-	"always"
-};
-
 /******************************************************************************/
 
-static inline bool
-metadata_thp_madvise(void) {
-	return (metadata_thp_enabled() &&
-	    (init_system_thp_mode == thp_mode_default));
-}
-
 static void *
-base_map(tsdn_t *tsdn, extent_hooks_t *extent_hooks, unsigned ind, size_t size) {
+base_map(tsdn_t *tsdn, ehooks_t *ehooks, unsigned ind, size_t size) {
 	void *addr;
 	bool zero = true;
 	bool commit = true;
@@ -37,22 +22,18 @@ base_map(tsdn_t *tsdn, extent_hooks_t *extent_hooks, unsigned ind, size_t size) 
 	/* Use huge page sizes and alignment regardless of opt_metadata_thp. */
 	assert(size == HUGEPAGE_CEILING(size));
 	size_t alignment = HUGEPAGE;
-	if (extent_hooks == &extent_hooks_default) {
+	if (ehooks_are_default(ehooks)) {
 		addr = extent_alloc_mmap(NULL, size, alignment, &zero, &commit);
 	} else {
-		/* No arena context as we are creating new arenas. */
-		tsd_t *tsd = tsdn_null(tsdn) ? tsd_fetch() : tsdn_tsd(tsdn);
-		pre_reentrancy(tsd, NULL);
-		addr = extent_hooks->alloc(extent_hooks, NULL, size, alignment,
-		    &zero, &commit, ind);
-		post_reentrancy(tsd);
+		addr = ehooks_alloc(tsdn, ehooks, NULL, size, alignment, &zero,
+		    &commit);
 	}
 
 	return addr;
 }
 
 static void
-base_unmap(tsdn_t *tsdn, extent_hooks_t *extent_hooks, unsigned ind, void *addr,
+base_unmap(tsdn_t *tsdn, ehooks_t *ehooks, unsigned ind, void *addr,
     size_t size) {
 	/*
 	 * Cascade through dalloc, decommit, purge_forced, and purge_lazy,
@@ -64,7 +45,7 @@ base_unmap(tsdn_t *tsdn, extent_hooks_t *extent_hooks, unsigned ind, void *addr,
 	 * may in fact want the end state of all associated virtual memory to be
 	 * in some consistent-but-allocated state.
 	 */
-	if (extent_hooks == &extent_hooks_default) {
+	if (ehooks_are_default(ehooks)) {
 		if (!extent_dalloc_mmap(addr, size)) {
 			goto label_done;
 		}
@@ -80,50 +61,43 @@ base_unmap(tsdn_t *tsdn, extent_hooks_t *extent_hooks, unsigned ind, void *addr,
 		/* Nothing worked.  This should never happen. */
 		not_reached();
 	} else {
-		tsd_t *tsd = tsdn_null(tsdn) ? tsd_fetch() : tsdn_tsd(tsdn);
-		pre_reentrancy(tsd, NULL);
-		if (extent_hooks->dalloc != NULL &&
-		    !extent_hooks->dalloc(extent_hooks, addr, size, true,
-		    ind)) {
-			goto label_post_reentrancy;
+		if (!ehooks_dalloc(tsdn, ehooks, addr, size, true)) {
+			goto label_done;
 		}
-		if (extent_hooks->decommit != NULL &&
-		    !extent_hooks->decommit(extent_hooks, addr, size, 0, size,
-		    ind)) {
-			goto label_post_reentrancy;
+		if (!ehooks_decommit(tsdn, ehooks, addr, size, 0, size)) {
+			goto label_done;
 		}
-		if (extent_hooks->purge_forced != NULL &&
-		    !extent_hooks->purge_forced(extent_hooks, addr, size, 0,
-		    size, ind)) {
-			goto label_post_reentrancy;
+		if (!ehooks_purge_forced(tsdn, ehooks, addr, size, 0, size)) {
+			goto label_done;
 		}
-		if (extent_hooks->purge_lazy != NULL &&
-		    !extent_hooks->purge_lazy(extent_hooks, addr, size, 0, size,
-		    ind)) {
-			goto label_post_reentrancy;
+		if (!ehooks_purge_lazy(tsdn, ehooks, addr, size, 0, size)) {
+			goto label_done;
 		}
 		/* Nothing worked.  That's the application's problem. */
-	label_post_reentrancy:
-		post_reentrancy(tsd);
 	}
 label_done:
-	if (metadata_thp_madvise()) {
-		/* Set NOHUGEPAGE after unmap to avoid kernel defrag. */
-		assert(((uintptr_t)addr & HUGEPAGE_MASK) == 0 &&
-		    (size & HUGEPAGE_MASK) == 0);
-		pages_nohuge(addr, size);
-	}
+	return;
+}
+
+static inline bool
+base_edata_is_reused(edata_t *edata) {
+	/*
+	 * Borrow the guarded bit to indicate if the extent is a recycled one,
+	 * i.e. the ones returned to base for reuse; currently only tcache bin
+	 * stacks.  Skips stats updating if so (needed for this purpose only).
+	 */
+	return edata_guarded_get(edata);
 }
 
 static void
-base_extent_init(size_t *extent_sn_next, extent_t *extent, void *addr,
+base_edata_init(size_t *extent_sn_next, edata_t *edata, void *addr,
     size_t size) {
 	size_t sn;
 
 	sn = *extent_sn_next;
 	(*extent_sn_next)++;
 
-	extent_binit(extent, addr, size, sn);
+	edata_binit(edata, addr, size, sn, false /* is_reused */);
 }
 
 static size_t
@@ -140,74 +114,71 @@ base_get_num_blocks(base_t *base, bool with_new_block) {
 	return n_blocks;
 }
 
-static void
-base_auto_thp_switch(tsdn_t *tsdn, base_t *base) {
-	assert(opt_metadata_thp == metadata_thp_auto);
-	malloc_mutex_assert_owner(tsdn, &base->mtx);
-	if (base->auto_thp_switched) {
-		return;
-	}
-	/* Called when adding a new block. */
-	bool should_switch;
-	if (base_ind_get(base) != 0) {
-		should_switch = (base_get_num_blocks(base, true) ==
-		    BASE_AUTO_THP_THRESHOLD);
-	} else {
-		should_switch = (base_get_num_blocks(base, true) ==
-		    BASE_AUTO_THP_THRESHOLD_A0);
-	}
-	if (!should_switch) {
-		return;
-	}
-
-	base->auto_thp_switched = true;
-	assert(!config_stats || base->n_thp == 0);
-	/* Make the initial blocks THP lazily. */
-	base_block_t *block = base->blocks;
-	while (block != NULL) {
-		assert((block->size & HUGEPAGE_MASK) == 0);
-		pages_huge(block, block->size);
-		if (config_stats) {
-			base->n_thp += HUGEPAGE_CEILING(block->size -
-			    extent_bsize_get(&block->extent)) >> LG_HUGEPAGE;
-		}
-		block = block->next;
-		assert(block == NULL || (base_ind_get(base) == 0));
-	}
-}
-
 static void *
-base_extent_bump_alloc_helper(extent_t *extent, size_t *gap_size, size_t size,
+base_extent_bump_alloc_helper(edata_t *edata, size_t *gap_size, size_t size,
     size_t alignment) {
 	void *ret;
 
 	assert(alignment == ALIGNMENT_CEILING(alignment, QUANTUM));
 	assert(size == ALIGNMENT_CEILING(size, alignment));
 
-	*gap_size = ALIGNMENT_CEILING((uintptr_t)extent_addr_get(extent),
-	    alignment) - (uintptr_t)extent_addr_get(extent);
-	ret = (void *)((uintptr_t)extent_addr_get(extent) + *gap_size);
-	assert(extent_bsize_get(extent) >= *gap_size + size);
-	extent_binit(extent, (void *)((uintptr_t)extent_addr_get(extent) +
-	    *gap_size + size), extent_bsize_get(extent) - *gap_size - size,
-	    extent_sn_get(extent));
+	*gap_size = ALIGNMENT_CEILING((uintptr_t)edata_addr_get(edata),
+	    alignment) - (uintptr_t)edata_addr_get(edata);
+	ret = (void *)((byte_t *)edata_addr_get(edata) + *gap_size);
+	assert(edata_bsize_get(edata) >= *gap_size + size);
+	edata_binit(edata, (void *)((byte_t *)edata_addr_get(edata) +
+	    *gap_size + size), edata_bsize_get(edata) - *gap_size - size,
+	    edata_sn_get(edata), base_edata_is_reused(edata));
 	return ret;
 }
 
 static void
-base_extent_bump_alloc_post(base_t *base, extent_t *extent, size_t gap_size,
-    void *addr, size_t size) {
-	if (extent_bsize_get(extent) > 0) {
-		/*
-		 * Compute the index for the largest size class that does not
-		 * exceed extent's size.
-		 */
-		szind_t index_floor =
-		    sz_size2index(extent_bsize_get(extent) + 1) - 1;
-		extent_heap_insert(&base->avail[index_floor], extent);
+base_edata_heap_insert(tsdn_t *tsdn, base_t *base, edata_t *edata) {
+	malloc_mutex_assert_owner(tsdn, &base->mtx);
+
+	size_t bsize = edata_bsize_get(edata);
+	assert(bsize > 0);
+	/*
+	 * Compute the index for the largest size class that does not exceed
+	 * extent's size.
+	 */
+	szind_t index_floor = sz_size2index(bsize + 1) - 1;
+	edata_heap_insert(&base->avail[index_floor], edata);
+}
+
+/*
+ * Only can be called by top-level functions, since it may call base_alloc
+ * internally when cache is empty.
+ */
+static edata_t *
+base_alloc_base_edata(tsdn_t *tsdn, base_t *base) {
+	edata_t *edata;
+
+	malloc_mutex_lock(tsdn, &base->mtx);
+	edata = edata_avail_first(&base->edata_avail);
+	if (edata != NULL) {
+		edata_avail_remove(&base->edata_avail, edata);
+	}
+	malloc_mutex_unlock(tsdn, &base->mtx);
+
+	if (edata == NULL) {
+		edata = base_alloc_edata(tsdn, base);
 	}
 
-	if (config_stats) {
+	return edata;
+}
+
+static void
+base_extent_bump_alloc_post(tsdn_t *tsdn, base_t *base, edata_t *edata,
+    size_t gap_size, void *addr, size_t size) {
+	if (edata_bsize_get(edata) > 0) {
+		base_edata_heap_insert(tsdn, base, edata);
+	} else {
+		/* Freed base edata_t stored in edata_avail. */
+		edata_avail_insert(&base->edata_avail, edata);
+	}
+
+	if (config_stats && !base_edata_is_reused(edata)) {
 		base->allocated += size;
 		/*
 		 * Add one PAGE to base_resident for every page boundary that is
@@ -218,24 +189,17 @@ base_extent_bump_alloc_post(base_t *base, extent_t *extent, size_t gap_size,
 		    PAGE_CEILING((uintptr_t)addr - gap_size);
 		assert(base->allocated <= base->resident);
 		assert(base->resident <= base->mapped);
-		if (metadata_thp_madvise() && (opt_metadata_thp ==
-		    metadata_thp_always || base->auto_thp_switched)) {
-			base->n_thp += (HUGEPAGE_CEILING((uintptr_t)addr + size)
-			    - HUGEPAGE_CEILING((uintptr_t)addr - gap_size)) >>
-			    LG_HUGEPAGE;
-			assert(base->mapped >= base->n_thp << LG_HUGEPAGE);
-		}
 	}
 }
 
 static void *
-base_extent_bump_alloc(base_t *base, extent_t *extent, size_t size,
+base_extent_bump_alloc(tsdn_t *tsdn, base_t *base, edata_t *edata, size_t size,
     size_t alignment) {
 	void *ret;
 	size_t gap_size;
 
-	ret = base_extent_bump_alloc_helper(extent, &gap_size, size, alignment);
-	base_extent_bump_alloc_post(base, extent, gap_size, ret, size);
+	ret = base_extent_bump_alloc_helper(edata, &gap_size, size, alignment);
+	base_extent_bump_alloc_post(tsdn, base, edata, gap_size, ret, size);
 	return ret;
 }
 
@@ -245,8 +209,8 @@ base_extent_bump_alloc(base_t *base, extent_t *extent, size_t size,
  * On success a pointer to the initialized base_block_t header is returned.
  */
 static base_block_t *
-base_block_alloc(tsdn_t *tsdn, base_t *base, extent_hooks_t *extent_hooks,
-    unsigned ind, pszind_t *pind_last, size_t *extent_sn_next, size_t size,
+base_block_alloc(tsdn_t *tsdn, base_t *base, ehooks_t *ehooks, unsigned ind,
+    pszind_t *pind_last, size_t *extent_sn_next, size_t size,
     size_t alignment) {
 	alignment = ALIGNMENT_CEILING(alignment, QUANTUM);
 	size_t usize = ALIGNMENT_CEILING(size, alignment);
@@ -262,41 +226,23 @@ base_block_alloc(tsdn_t *tsdn, base_t *base, extent_hooks_t *extent_hooks,
 	 */
 	size_t min_block_size = HUGEPAGE_CEILING(sz_psz2u(header_size + gap_size
 	    + usize));
-	pszind_t pind_next = (*pind_last + 1 < NPSIZES) ? *pind_last + 1 :
-	    *pind_last;
+	pszind_t pind_next = (*pind_last + 1 < sz_psz2ind(SC_LARGE_MAXCLASS)) ?
+	    *pind_last + 1 : *pind_last;
 	size_t next_block_size = HUGEPAGE_CEILING(sz_pind2sz(pind_next));
 	size_t block_size = (min_block_size > next_block_size) ? min_block_size
 	    : next_block_size;
-	base_block_t *block = (base_block_t *)base_map(tsdn, extent_hooks, ind,
+	base_block_t *block = (base_block_t *)base_map(tsdn, ehooks, ind,
 	    block_size);
 	if (block == NULL) {
 		return NULL;
-	}
-
-	if (metadata_thp_madvise()) {
-		void *addr = (void *)block;
-		assert(((uintptr_t)addr & HUGEPAGE_MASK) == 0 &&
-		    (block_size & HUGEPAGE_MASK) == 0);
-		if (opt_metadata_thp == metadata_thp_always) {
-			pages_huge(addr, block_size);
-		} else if (opt_metadata_thp == metadata_thp_auto &&
-		    base != NULL) {
-			/* base != NULL indicates this is not a new base. */
-			malloc_mutex_lock(tsdn, &base->mtx);
-			base_auto_thp_switch(tsdn, base);
-			if (base->auto_thp_switched) {
-				pages_huge(addr, block_size);
-			}
-			malloc_mutex_unlock(tsdn, &base->mtx);
-		}
 	}
 
 	*pind_last = sz_psz2ind(block_size);
 	block->size = block_size;
 	block->next = NULL;
 	assert(block_size >= header_size);
-	base_extent_init(extent_sn_next, &block->extent,
-	    (void *)((uintptr_t)block + header_size), block_size - header_size);
+	base_edata_init(extent_sn_next, &block->edata,
+	    (void *)((byte_t *)block + header_size), block_size - header_size);
 	return block;
 }
 
@@ -304,17 +250,17 @@ base_block_alloc(tsdn_t *tsdn, base_t *base, extent_hooks_t *extent_hooks,
  * Allocate an extent that is at least as large as specified size, with
  * specified alignment.
  */
-static extent_t *
+static edata_t *
 base_extent_alloc(tsdn_t *tsdn, base_t *base, size_t size, size_t alignment) {
 	malloc_mutex_assert_owner(tsdn, &base->mtx);
 
-	extent_hooks_t *extent_hooks = base_extent_hooks_get(base);
+	ehooks_t *ehooks = base_ehooks_get_for_metadata(base);
 	/*
 	 * Drop mutex during base_block_alloc(), because an extent hook will be
 	 * called.
 	 */
 	malloc_mutex_unlock(tsdn, &base->mtx);
-	base_block_t *block = base_block_alloc(tsdn, base, extent_hooks,
+	base_block_t *block = base_block_alloc(tsdn, base, ehooks,
 	    base_ind_get(base), &base->pind_last, &base->extent_sn_next, size,
 	    alignment);
 	malloc_mutex_lock(tsdn, &base->mtx);
@@ -327,18 +273,11 @@ base_extent_alloc(tsdn_t *tsdn, base_t *base, size_t size, size_t alignment) {
 		base->allocated += sizeof(base_block_t);
 		base->resident += PAGE_CEILING(sizeof(base_block_t));
 		base->mapped += block->size;
-		if (metadata_thp_madvise() &&
-		    !(opt_metadata_thp == metadata_thp_auto
-		      && !base->auto_thp_switched)) {
-			assert(base->n_thp > 0);
-			base->n_thp += HUGEPAGE_CEILING(sizeof(base_block_t)) >>
-			    LG_HUGEPAGE;
-		}
+
 		assert(base->allocated <= base->resident);
 		assert(base->resident <= base->mapped);
-		assert(base->n_thp << LG_HUGEPAGE <= base->mapped);
 	}
-	return &block->extent;
+	return &block->edata;
 }
 
 base_t *
@@ -347,10 +286,22 @@ b0get(void) {
 }
 
 base_t *
-base_new(tsdn_t *tsdn, unsigned ind, extent_hooks_t *extent_hooks) {
+base_new(tsdn_t *tsdn, unsigned ind, const extent_hooks_t *extent_hooks,
+    bool metadata_use_hooks) {
 	pszind_t pind_last = 0;
 	size_t extent_sn_next = 0;
-	base_block_t *block = base_block_alloc(tsdn, NULL, extent_hooks, ind,
+
+	/*
+	 * The base will contain the ehooks eventually, but it itself is
+	 * allocated using them.  So we use some stack ehooks to bootstrap its
+	 * memory, and then initialize the ehooks within the base_t.
+	 */
+	ehooks_t fake_ehooks;
+	ehooks_init(&fake_ehooks, metadata_use_hooks ?
+	    (extent_hooks_t *)extent_hooks :
+	    (extent_hooks_t *)&ehooks_default_extent_hooks, ind);
+
+	base_block_t *block = base_block_alloc(tsdn, NULL, &fake_ehooks, ind,
 	    &pind_last, &extent_sn_next, sizeof(base_t), QUANTUM);
 	if (block == NULL) {
 		return NULL;
@@ -359,93 +310,106 @@ base_new(tsdn_t *tsdn, unsigned ind, extent_hooks_t *extent_hooks) {
 	size_t gap_size;
 	size_t base_alignment = CACHELINE;
 	size_t base_size = ALIGNMENT_CEILING(sizeof(base_t), base_alignment);
-	base_t *base = (base_t *)base_extent_bump_alloc_helper(&block->extent,
+	base_t *base = (base_t *)base_extent_bump_alloc_helper(&block->edata,
 	    &gap_size, base_size, base_alignment);
-	base->ind = ind;
-	atomic_store_p(&base->extent_hooks, extent_hooks, ATOMIC_RELAXED);
+	ehooks_init(&base->ehooks, (extent_hooks_t *)extent_hooks, ind);
+	ehooks_init(&base->ehooks_base, metadata_use_hooks ?
+	    (extent_hooks_t *)extent_hooks :
+	    (extent_hooks_t *)&ehooks_default_extent_hooks, ind);
 	if (malloc_mutex_init(&base->mtx, "base", WITNESS_RANK_BASE,
 	    malloc_mutex_rank_exclusive)) {
-		base_unmap(tsdn, extent_hooks, ind, block, block->size);
+		base_unmap(tsdn, &fake_ehooks, ind, block, block->size);
 		return NULL;
 	}
 	base->pind_last = pind_last;
 	base->extent_sn_next = extent_sn_next;
 	base->blocks = block;
-	base->auto_thp_switched = false;
-	for (szind_t i = 0; i < NSIZES; i++) {
-		extent_heap_new(&base->avail[i]);
+	for (szind_t i = 0; i < SC_NSIZES; i++) {
+		edata_heap_new(&base->avail[i]);
 	}
+	edata_avail_new(&base->edata_avail);
+
 	if (config_stats) {
+		base->edata_allocated = 0;
+		base->rtree_allocated = 0;
 		base->allocated = sizeof(base_block_t);
 		base->resident = PAGE_CEILING(sizeof(base_block_t));
 		base->mapped = block->size;
-		base->n_thp = (opt_metadata_thp == metadata_thp_always) &&
-		    metadata_thp_madvise() ? HUGEPAGE_CEILING(sizeof(base_block_t))
-		    >> LG_HUGEPAGE : 0;
 		assert(base->allocated <= base->resident);
 		assert(base->resident <= base->mapped);
-		assert(base->n_thp << LG_HUGEPAGE <= base->mapped);
 	}
-	base_extent_bump_alloc_post(base, &block->extent, gap_size, base,
+
+	/* Locking here is only necessary because of assertions. */
+	malloc_mutex_lock(tsdn, &base->mtx);
+	base_extent_bump_alloc_post(tsdn, base, &block->edata, gap_size, base,
 	    base_size);
+	malloc_mutex_unlock(tsdn, &base->mtx);
 
 	return base;
 }
 
 void
 base_delete(tsdn_t *tsdn, base_t *base) {
-	extent_hooks_t *extent_hooks = base_extent_hooks_get(base);
+	ehooks_t *ehooks = base_ehooks_get_for_metadata(base);
 	base_block_t *next = base->blocks;
 	do {
 		base_block_t *block = next;
 		next = block->next;
-		base_unmap(tsdn, extent_hooks, base_ind_get(base), block,
+		base_unmap(tsdn, ehooks, base_ind_get(base), block,
 		    block->size);
 	} while (next != NULL);
 }
 
-extent_hooks_t *
-base_extent_hooks_get(base_t *base) {
-	return (extent_hooks_t *)atomic_load_p(&base->extent_hooks,
-	    ATOMIC_ACQUIRE);
+ehooks_t *
+base_ehooks_get(base_t *base) {
+	return &base->ehooks;
+}
+
+ehooks_t *
+base_ehooks_get_for_metadata(base_t *base) {
+	return &base->ehooks_base;
 }
 
 extent_hooks_t *
 base_extent_hooks_set(base_t *base, extent_hooks_t *extent_hooks) {
-	extent_hooks_t *old_extent_hooks = base_extent_hooks_get(base);
-	atomic_store_p(&base->extent_hooks, extent_hooks, ATOMIC_RELEASE);
+	extent_hooks_t *old_extent_hooks =
+	    ehooks_get_extent_hooks_ptr(&base->ehooks);
+	ehooks_init(&base->ehooks, extent_hooks, ehooks_ind_get(&base->ehooks));
 	return old_extent_hooks;
 }
 
 static void *
 base_alloc_impl(tsdn_t *tsdn, base_t *base, size_t size, size_t alignment,
-    size_t *esn) {
+    size_t *esn, size_t *ret_usize) {
 	alignment = QUANTUM_CEILING(alignment);
 	size_t usize = ALIGNMENT_CEILING(size, alignment);
 	size_t asize = usize + alignment - QUANTUM;
 
-	extent_t *extent = NULL;
+	edata_t *edata = NULL;
 	malloc_mutex_lock(tsdn, &base->mtx);
-	for (szind_t i = sz_size2index(asize); i < NSIZES; i++) {
-		extent = extent_heap_remove_first(&base->avail[i]);
-		if (extent != NULL) {
+	for (szind_t i = sz_size2index(asize); i < SC_NSIZES; i++) {
+		edata = edata_heap_remove_first(&base->avail[i]);
+		if (edata != NULL) {
 			/* Use existing space. */
 			break;
 		}
 	}
-	if (extent == NULL) {
+	if (edata == NULL) {
 		/* Try to allocate more space. */
-		extent = base_extent_alloc(tsdn, base, usize, alignment);
+		edata = base_extent_alloc(tsdn, base, usize, alignment);
 	}
 	void *ret;
-	if (extent == NULL) {
+	if (edata == NULL) {
 		ret = NULL;
 		goto label_return;
 	}
 
-	ret = base_extent_bump_alloc(base, extent, usize, alignment);
+	ret = base_extent_bump_alloc(tsdn, base, edata, usize, alignment);
 	if (esn != NULL) {
-		*esn = extent_sn_get(extent);
+		*esn = (size_t)edata_sn_get(edata);
+	}
+	if (ret_usize != NULL) {
+		*ret_usize = usize;
 	}
 label_return:
 	malloc_mutex_unlock(tsdn, &base->mtx);
@@ -462,33 +426,122 @@ label_return:
  */
 void *
 base_alloc(tsdn_t *tsdn, base_t *base, size_t size, size_t alignment) {
-	return base_alloc_impl(tsdn, base, size, alignment, NULL);
+	return base_alloc_impl(tsdn, base, size, alignment, NULL, NULL);
 }
 
-extent_t *
-base_alloc_extent(tsdn_t *tsdn, base_t *base) {
-	size_t esn;
-	extent_t *extent = base_alloc_impl(tsdn, base, sizeof(extent_t),
-	    CACHELINE, &esn);
-	if (extent == NULL) {
+edata_t *
+base_alloc_edata(tsdn_t *tsdn, base_t *base) {
+	size_t esn, usize;
+	edata_t *edata = base_alloc_impl(tsdn, base, sizeof(edata_t),
+	    EDATA_ALIGNMENT, &esn, &usize);
+	if (edata == NULL) {
 		return NULL;
 	}
-	extent_esn_set(extent, esn);
-	return extent;
+	if (config_stats) {
+		base->edata_allocated += usize;
+	}
+	edata_esn_set(edata, esn);
+	return edata;
+}
+
+void *
+base_alloc_rtree(tsdn_t *tsdn, base_t *base, size_t size) {
+	size_t usize;
+	void *rtree = base_alloc_impl(tsdn, base, size, CACHELINE, NULL,
+	    &usize);
+	if (rtree == NULL) {
+		return NULL;
+	}
+	if (config_stats) {
+		base->rtree_allocated += usize;
+	}
+	return rtree;
+}
+
+static inline void
+b0_alloc_header_size(size_t *header_size, size_t *alignment) {
+	*alignment = QUANTUM;
+	*header_size = QUANTUM > sizeof(edata_t *) ? QUANTUM :
+	    sizeof(edata_t *);
+}
+
+/*
+ * Each piece allocated here is managed by a separate edata, because it was bump
+ * allocated and cannot be merged back into the original base_block.  This means
+ * it's not for general purpose: 1) they are not page aligned, nor page sized,
+ * and 2) the requested size should not be too small (as each piece comes with
+ * an edata_t).  Only used for tcache bin stack allocation now.
+ */
+void *
+b0_alloc_tcache_stack(tsdn_t *tsdn, size_t stack_size) {
+	base_t *base = b0get();
+	edata_t *edata = base_alloc_base_edata(tsdn, base);
+	if (edata == NULL) {
+		return NULL;
+	}
+
+	/*
+	 * Reserve room for the header, which stores a pointer to the managing
+	 * edata_t.  The header itself is located right before the return
+	 * address, so that edata can be retrieved on dalloc.  Bump up to usize
+	 * to improve reusability -- otherwise the freed stacks will be put back
+	 * into the previous size class.
+	 */
+	size_t esn, alignment, header_size;
+	b0_alloc_header_size(&header_size, &alignment);
+
+	size_t alloc_size = sz_s2u(stack_size + header_size);
+	void *addr = base_alloc_impl(tsdn, base, alloc_size, alignment, &esn,
+	    NULL);
+	if (addr == NULL) {
+		edata_avail_insert(&base->edata_avail, edata);
+		return NULL;
+	}
+
+	/* Set is_reused: see comments in base_edata_is_reused. */
+	edata_binit(edata, addr, alloc_size, esn, true /* is_reused */);
+	*(edata_t **)addr = edata;
+
+	return (byte_t *)addr + header_size;
 }
 
 void
-base_stats_get(tsdn_t *tsdn, base_t *base, size_t *allocated, size_t *resident,
-    size_t *mapped, size_t *n_thp) {
+b0_dalloc_tcache_stack(tsdn_t *tsdn, void *tcache_stack) {
+	/* edata_t pointer stored in header. */
+	size_t alignment, header_size;
+	b0_alloc_header_size(&header_size, &alignment);
+
+	edata_t *edata = *(edata_t **)((byte_t *)tcache_stack - header_size);
+	void *addr = edata_addr_get(edata);
+	size_t bsize = edata_bsize_get(edata);
+	/* Marked as "reused" to avoid double counting stats. */
+	assert(base_edata_is_reused(edata));
+	assert(addr != NULL && bsize > 0);
+
+	/* Zero out since base_alloc returns zeroed memory. */
+	memset(addr, 0, bsize);
+
+	base_t *base = b0get();
+	malloc_mutex_lock(tsdn, &base->mtx);
+	base_edata_heap_insert(tsdn, base, edata);
+	malloc_mutex_unlock(tsdn, &base->mtx);
+}
+
+void
+base_stats_get(tsdn_t *tsdn, base_t *base, size_t *allocated,
+    size_t *edata_allocated, size_t *rtree_allocated, size_t *resident,
+    size_t *mapped) {
 	cassert(config_stats);
 
 	malloc_mutex_lock(tsdn, &base->mtx);
 	assert(base->allocated <= base->resident);
 	assert(base->resident <= base->mapped);
+	assert(base->edata_allocated + base->rtree_allocated <= base->allocated);
 	*allocated = base->allocated;
+	*edata_allocated = base->edata_allocated;
+	*rtree_allocated = base->rtree_allocated;
 	*resident = base->resident;
 	*mapped = base->mapped;
-	*n_thp = base->n_thp;
 	malloc_mutex_unlock(tsdn, &base->mtx);
 }
 
@@ -509,6 +562,7 @@ base_postfork_child(tsdn_t *tsdn, base_t *base) {
 
 bool
 base_boot(tsdn_t *tsdn) {
-	b0 = base_new(tsdn, 0, (extent_hooks_t *)&extent_hooks_default);
+	b0 = base_new(tsdn, 0, (extent_hooks_t *)&ehooks_default_extent_hooks,
+	    /* metadata_use_hooks */ true);
 	return (b0 == NULL);
 }

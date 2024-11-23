@@ -1,6 +1,12 @@
 #ifndef JEMALLOC_INTERNAL_PAGES_EXTERNS_H
 #define JEMALLOC_INTERNAL_PAGES_EXTERNS_H
 
+#include "jemalloc/internal/jemalloc_preamble.h"
+#include "jemalloc/internal/jemalloc_internal_types.h"
+
+/* Actual operating system page size, detected during bootstrap, <= PAGE. */
+extern size_t	os_page;
+
 /* Page size.  LG_PAGE is determined by the configure script. */
 #ifdef PAGE_MASK
 #  undef PAGE_MASK
@@ -9,17 +15,42 @@
 #define PAGE_MASK	((size_t)(PAGE - 1))
 /* Return the page base address for the page containing address a. */
 #define PAGE_ADDR2BASE(a)						\
-	((void *)((uintptr_t)(a) & ~PAGE_MASK))
+	ALIGNMENT_ADDR2BASE(a, PAGE)
 /* Return the smallest pagesize multiple that is >= s. */
 #define PAGE_CEILING(s)							\
 	(((s) + PAGE_MASK) & ~PAGE_MASK)
+/* Return the largest pagesize multiple that is <=s. */
+#define PAGE_FLOOR(s) 							\
+	((s) & ~PAGE_MASK)
 
 /* Huge page size.  LG_HUGEPAGE is determined by the configure script. */
 #define HUGEPAGE	((size_t)(1U << LG_HUGEPAGE))
 #define HUGEPAGE_MASK	((size_t)(HUGEPAGE - 1))
+
+/*
+ * Used to validate that the hugepage size is not unexpectedly high.  The huge
+ * page features (HPA, metadata_thp) are primarily designed with a 2M THP size
+ * in mind.  Much larger sizes are not tested and likely to cause issues such as
+ * bad fragmentation or simply broken.
+ */
+#define HUGEPAGE_MAX_EXPECTED_SIZE ((size_t)(16U << 20))
+
+#if LG_HUGEPAGE != 0
+#  define HUGEPAGE_PAGES (HUGEPAGE / PAGE)
+#else
+/*
+ * It's convenient to define arrays (or bitmaps) of HUGEPAGE_PAGES lengths.  If
+ * we can't autodetect the hugepage size, it gets treated as 0, in which case
+ * we'll trigger a compiler error in those arrays.  Avoid this case by ensuring
+ * that this value is at least 1.  (We won't ever run in this degraded state;
+ * hpa_supported() returns false in this case.
+ */
+#  define HUGEPAGE_PAGES 1
+#endif
+
 /* Return the huge page base address for the huge page containing address a. */
 #define HUGEPAGE_ADDR2BASE(a)						\
-	((void *)((uintptr_t)(a) & ~HUGEPAGE_MASK))
+	ALIGNMENT_ADDR2BASE(a, HUGEPAGE)
 /* Return the smallest pagesize multiple that is >= s. */
 #define HUGEPAGE_CEILING(s)						\
 	(((s) + HUGEPAGE_MASK) & ~HUGEPAGE_MASK)
@@ -58,19 +89,17 @@ static const bool pages_can_purge_forced =
 #endif
     ;
 
-typedef enum {
-	thp_mode_default       = 0, /* Do not change hugepage settings. */
-	thp_mode_always        = 1, /* Always set MADV_HUGEPAGE. */
-	thp_mode_never         = 2, /* Always set MADV_NOHUGEPAGE. */
+#if defined(JEMALLOC_HAVE_MADVISE_HUGE) || defined(JEMALLOC_HAVE_MEMCNTL)
+#  define PAGES_CAN_HUGIFY
+#endif
 
-	thp_mode_names_limit   = 3, /* Used for option processing. */
-	thp_mode_not_supported = 3  /* No THP support detected. */
-} thp_mode_t;
-
-#define THP_MODE_DEFAULT thp_mode_default
-extern thp_mode_t opt_thp;
-extern thp_mode_t init_system_thp_mode; /* Initial system wide state. */
-extern const char *thp_mode_names[];
+static const bool pages_can_hugify =
+#ifdef PAGES_CAN_HUGIFY
+    true
+#else
+    false
+#endif
+    ;
 
 void *pages_map(void *addr, size_t size, size_t alignment, bool *commit);
 void pages_unmap(void *addr, size_t size);
@@ -83,6 +112,7 @@ bool pages_nohuge(void *addr, size_t size);
 bool pages_dontdump(void *addr, size_t size);
 bool pages_dodump(void *addr, size_t size);
 bool pages_boot(void);
-void pages_set_thp_state (void *ptr, size_t size);
+void pages_mark_guards(void *head, void *tail);
+void pages_unmark_guards(void *head, void *tail);
 
 #endif /* JEMALLOC_INTERNAL_PAGES_EXTERNS_H */

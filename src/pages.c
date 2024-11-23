@@ -1,4 +1,3 @@
-#define JEMALLOC_PAGES_C_
 #include "jemalloc/internal/jemalloc_preamble.h"
 
 #include "jemalloc/internal/pages.h"
@@ -14,6 +13,21 @@
 #include <vm/vm_param.h>
 #endif
 #endif
+#ifdef __NetBSD__
+#include <sys/bitops.h>	/* ilog2 */
+#endif
+#ifdef JEMALLOC_HAVE_VM_MAKE_TAG
+#define PAGES_FD_TAG VM_MAKE_TAG(254U)
+#else
+#define PAGES_FD_TAG -1
+#endif
+#if defined(JEMALLOC_HAVE_PRCTL) && defined(JEMALLOC_PAGEID)
+#include <sys/prctl.h>
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+#endif
 
 /******************************************************************************/
 /* Defines/includes needed for special android code. */
@@ -26,26 +40,33 @@
 /* Data. */
 
 /* Actual operating system page size, detected during bootstrap, <= PAGE. */
-static size_t	os_page;
+size_t	os_page;
 
 #ifndef _WIN32
 #  define PAGES_PROT_COMMIT (PROT_READ | PROT_WRITE)
 #  define PAGES_PROT_DECOMMIT (PROT_NONE)
 static int	mmap_flags;
 #endif
-static bool	os_overcommits;
-
-const char *thp_mode_names[] = {
-	"default",
-	"always",
-	"never",
-	"not supported"
-};
-thp_mode_t opt_thp = THP_MODE_DEFAULT;
-thp_mode_t init_system_thp_mode;
+#define os_overcommits true
 
 /* Runtime support for lazy purge. Irrelevant when !pages_can_purge_lazy. */
 static bool pages_can_purge_lazy_runtime = true;
+
+#ifdef JEMALLOC_PAGEID
+static int os_page_id(void *addr, size_t size, const char *name)
+{
+#ifdef JEMALLOC_HAVE_PRCTL
+	/*
+	 * While parsing `/proc/<pid>/maps` file, the block could appear as
+	 * 7f4836000000-7f4836800000 rw-p 00000000 00:00 0 [anon:jemalloc_pg_overcommit]`
+	 */
+	return prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, (uintptr_t)addr, size,
+	    (uintptr_t)name);
+#else
+	return 0;
+#endif
+}
+#endif
 
 /******************************************************************************/
 /*
@@ -81,9 +102,22 @@ os_pages_map(void *addr, size_t size, size_t alignment, bool *commit) {
 	 * of existing mappings, and we only want to create new mappings.
 	 */
 	{
+		int flags = mmap_flags;
+#ifdef __NetBSD__
+		/*
+		 * On NetBSD PAGE for a platform is defined to the
+		 * maximum page size of all machine architectures
+		 * for that platform, so that we can use the same
+		 * binaries across all machine architectures.
+		 */
+		if (alignment > os_page || PAGE > os_page) {
+			unsigned int a = ilog2(MAX(alignment, PAGE));
+			flags |= MAP_ALIGNED(a);
+		}
+#endif
 		int prot = *commit ? PAGES_PROT_COMMIT : PAGES_PROT_DECOMMIT;
 
-		ret = mmap(addr, size, prot, mmap_flags, -1, 0);
+		ret = mmap(addr, size, prot, flags, PAGES_FD_TAG, 0);
 	}
 	assert(ret != NULL);
 
@@ -106,13 +140,18 @@ os_pages_map(void *addr, size_t size, size_t alignment, bool *commit) {
 #endif
 	assert(ret == NULL || (addr == NULL && ret != addr) || (addr != NULL &&
 	    ret == addr));
+#ifdef JEMALLOC_PAGEID
+	int n = os_page_id(ret, size,
+	    os_overcommits ? "jemalloc_pg_overcommit" : "jemalloc_pg");
+	assert(n == 0 || (n == -1 && get_errno() == EINVAL));
+#endif
 	return ret;
 }
 
 static void *
 os_pages_trim(void *addr, size_t alloc_size, size_t leadsize, size_t size,
     bool *commit) {
-	void *ret = (void *)((uintptr_t)addr + leadsize);
+	void *ret = (void *)((byte_t *)addr + leadsize);
 
 	assert(alloc_size >= leadsize + size);
 #ifdef _WIN32
@@ -132,7 +171,7 @@ os_pages_trim(void *addr, size_t alloc_size, size_t leadsize, size_t size,
 		os_pages_unmap(addr, leadsize);
 	}
 	if (trailsize != 0) {
-		os_pages_unmap((void *)((uintptr_t)ret + size), trailsize);
+		os_pages_unmap((void *)((byte_t *)ret + size), trailsize);
 	}
 	return ret;
 #endif
@@ -194,6 +233,35 @@ pages_map(void *addr, size_t size, size_t alignment, bool *commit) {
 	assert(alignment >= PAGE);
 	assert(ALIGNMENT_ADDR2BASE(addr, alignment) == addr);
 
+#if defined(__FreeBSD__) && defined(MAP_EXCL)
+	/*
+	 * FreeBSD has mechanisms both to mmap at specific address without
+	 * touching existing mappings, and to mmap with specific alignment.
+	 */
+	{
+		if (os_overcommits) {
+			*commit = true;
+		}
+
+		int prot = *commit ? PAGES_PROT_COMMIT : PAGES_PROT_DECOMMIT;
+		int flags = mmap_flags;
+
+		if (addr != NULL) {
+			flags |= MAP_FIXED | MAP_EXCL;
+		} else {
+			unsigned alignment_bits = ffs_zu(alignment);
+			assert(alignment_bits > 0);
+			flags |= MAP_ALIGNED(alignment_bits);
+		}
+
+		void *ret = mmap(addr, size, prot, flags, -1, 0);
+		if (ret == MAP_FAILED) {
+			ret = NULL;
+		}
+
+		return ret;
+	}
+#endif
 	/*
 	 * Ideally, there would be a way to specify alignment to mmap() (like
 	 * NetBSD has), but in the absence of such a feature, we have to work
@@ -231,13 +299,9 @@ pages_unmap(void *addr, size_t size) {
 }
 
 static bool
-pages_commit_impl(void *addr, size_t size, bool commit) {
+os_pages_commit(void *addr, size_t size, bool commit) {
 	assert(PAGE_ADDR2BASE(addr) == addr);
 	assert(PAGE_CEILING(size) == size);
-
-	if (os_overcommits) {
-		return true;
-	}
 
 #ifdef _WIN32
 	return (commit ? (addr != VirtualAlloc(addr, size, MEM_COMMIT,
@@ -246,7 +310,7 @@ pages_commit_impl(void *addr, size_t size, bool commit) {
 	{
 		int prot = commit ? PAGES_PROT_COMMIT : PAGES_PROT_DECOMMIT;
 		void *result = mmap(addr, size, prot, mmap_flags | MAP_FIXED,
-		    -1, 0);
+		    PAGES_FD_TAG, 0);
 		if (result == MAP_FAILED) {
 			return true;
 		}
@@ -263,6 +327,15 @@ pages_commit_impl(void *addr, size_t size, bool commit) {
 #endif
 }
 
+static bool
+pages_commit_impl(void *addr, size_t size, bool commit) {
+	if (os_overcommits) {
+		return true;
+	}
+
+	return os_pages_commit(addr, size, commit);
+}
+
 bool
 pages_commit(void *addr, size_t size) {
 	return pages_commit_impl(addr, size, true);
@@ -273,9 +346,69 @@ pages_decommit(void *addr, size_t size) {
 	return pages_commit_impl(addr, size, false);
 }
 
+void
+pages_mark_guards(void *head, void *tail) {
+	assert(head != NULL || tail != NULL);
+	assert(head == NULL || tail == NULL ||
+	    (uintptr_t)head < (uintptr_t)tail);
+#ifdef JEMALLOC_HAVE_MPROTECT
+	if (head != NULL) {
+		mprotect(head, PAGE, PROT_NONE);
+	}
+	if (tail != NULL) {
+		mprotect(tail, PAGE, PROT_NONE);
+	}
+#else
+	/* Decommit sets to PROT_NONE / MEM_DECOMMIT. */
+	if (head != NULL) {
+		os_pages_commit(head, PAGE, false);
+	}
+	if (tail != NULL) {
+		os_pages_commit(tail, PAGE, false);
+	}
+#endif
+}
+
+void
+pages_unmark_guards(void *head, void *tail) {
+	assert(head != NULL || tail != NULL);
+	assert(head == NULL || tail == NULL ||
+	    (uintptr_t)head < (uintptr_t)tail);
+#ifdef JEMALLOC_HAVE_MPROTECT
+	bool head_and_tail = (head != NULL) && (tail != NULL);
+	size_t range = head_and_tail ?
+	    (uintptr_t)tail - (uintptr_t)head + PAGE :
+	    SIZE_T_MAX;
+	/*
+	 * The amount of work that the kernel does in mprotect depends on the
+	 * range argument.  SC_LARGE_MINCLASS is an arbitrary threshold chosen
+	 * to prevent kernel from doing too much work that would outweigh the
+	 * savings of performing one less system call.
+	 */
+	bool ranged_mprotect = head_and_tail && range <= SC_LARGE_MINCLASS;
+	if (ranged_mprotect) {
+		mprotect(head, range, PROT_READ | PROT_WRITE);
+	} else {
+		if (head != NULL) {
+			mprotect(head, PAGE, PROT_READ | PROT_WRITE);
+		}
+		if (tail != NULL) {
+			mprotect(tail, PAGE, PROT_READ | PROT_WRITE);
+		}
+	}
+#else
+	if (head != NULL) {
+		os_pages_commit(head, PAGE, true);
+	}
+	if (tail != NULL) {
+		os_pages_commit(tail, PAGE, true);
+	}
+#endif
+}
+
 bool
 pages_purge_lazy(void *addr, size_t size) {
-	assert(PAGE_ADDR2BASE(addr) == addr);
+	assert(ALIGNMENT_ADDR2BASE(addr, os_page) == addr);
 	assert(PAGE_CEILING(size) == size);
 
 	if (!pages_can_purge_lazy) {
@@ -303,6 +436,9 @@ pages_purge_lazy(void *addr, size_t size) {
 #elif defined(JEMALLOC_PURGE_MADVISE_DONTNEED) && \
     !defined(JEMALLOC_PURGE_MADVISE_DONTNEED_ZEROS)
 	return (madvise(addr, size, MADV_DONTNEED) != 0);
+#elif defined(JEMALLOC_PURGE_POSIX_MADVISE_DONTNEED) && \
+    !defined(JEMALLOC_PURGE_POSIX_MADVISE_DONTNEED_ZEROS)
+	return (posix_madvise(addr, size, POSIX_MADV_DONTNEED) != 0);
 #else
 	not_reached();
 #endif
@@ -320,6 +456,9 @@ pages_purge_forced(void *addr, size_t size) {
 #if defined(JEMALLOC_PURGE_MADVISE_DONTNEED) && \
     defined(JEMALLOC_PURGE_MADVISE_DONTNEED_ZEROS)
 	return (madvise(addr, size, MADV_DONTNEED) != 0);
+#elif defined(JEMALLOC_PURGE_POSIX_MADVISE_DONTNEED) && \
+    defined(JEMALLOC_PURGE_POSIX_MADVISE_DONTNEED_ZEROS)
+	return (posix_madvise(addr, size, POSIX_MADV_DONTNEED) != 0);
 #elif defined(JEMALLOC_MAPS_COALESCE)
 	/* Try to overlay a new demand-zeroed mapping. */
 	return pages_commit(addr, size);
@@ -334,8 +473,13 @@ pages_huge_impl(void *addr, size_t size, bool aligned) {
 		assert(HUGEPAGE_ADDR2BASE(addr) == addr);
 		assert(HUGEPAGE_CEILING(size) == size);
 	}
-#ifdef JEMALLOC_HAVE_MADVISE_HUGE
+#if defined(JEMALLOC_HAVE_MADVISE_HUGE)
 	return (madvise(addr, size, MADV_HUGEPAGE) != 0);
+#elif defined(JEMALLOC_HAVE_MEMCNTL)
+	struct memcntl_mha m = {0};
+	m.mha_cmd = MHA_MAPSIZE_VA;
+	m.mha_pagesize = HUGEPAGE;
+	return (memcntl(addr, size, MC_HAT_ADVISE, (caddr_t)&m, 0, 0) == 0);
 #else
 	return true;
 #endif
@@ -379,8 +523,10 @@ bool
 pages_dontdump(void *addr, size_t size) {
 	assert(PAGE_ADDR2BASE(addr) == addr);
 	assert(PAGE_CEILING(size) == size);
-#ifdef JEMALLOC_MADVISE_DONTDUMP
+#if defined(JEMALLOC_MADVISE_DONTDUMP)
 	return madvise(addr, size, MADV_DONTDUMP) != 0;
+#elif defined(JEMALLOC_MADVISE_NOCORE)
+	return madvise(addr, size, MADV_NOCORE) != 0;
 #else
 	return false;
 #endif
@@ -390,8 +536,10 @@ bool
 pages_dodump(void *addr, size_t size) {
 	assert(PAGE_ADDR2BASE(addr) == addr);
 	assert(PAGE_CEILING(size) == size);
-#ifdef JEMALLOC_MADVISE_DONTDUMP
+#if defined(JEMALLOC_MADVISE_DONTDUMP)
 	return madvise(addr, size, MADV_DODUMP) != 0;
+#elif defined(JEMALLOC_MADVISE_NOCORE)
+	return madvise(addr, size, MADV_CORE) != 0;
 #else
 	return false;
 #endif
@@ -405,6 +553,10 @@ os_page_detect(void) {
 	GetSystemInfo(&si);
 	return si.dwPageSize;
 #elif defined(__FreeBSD__)
+	/*
+	 * This returns the value obtained from
+	 * the auxv vector, avoiding a syscall.
+	 */
 	return getpagesize();
 #else
 	long result = sysconf(_SC_PAGESIZE);
@@ -451,36 +603,13 @@ os_overcommits_proc(void) {
 	int fd;
 	char buf[1];
 
-#if defined(JEMALLOC_USE_SYSCALL) && defined(SYS_open)
-	#if defined(O_CLOEXEC)
-		fd = (int)syscall(SYS_open, "/proc/sys/vm/overcommit_memory", O_RDONLY |
-			O_CLOEXEC);
-	#else
-		fd = (int)syscall(SYS_open, "/proc/sys/vm/overcommit_memory", O_RDONLY);
-		if (fd != -1) {
-			fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-		}
-	#endif
-#elif defined(JEMALLOC_USE_SYSCALL) && defined(SYS_openat)
-	#if defined(O_CLOEXEC)
-		fd = (int)syscall(SYS_openat,
-			AT_FDCWD, "/proc/sys/vm/overcommit_memory", O_RDONLY | O_CLOEXEC);
-	#else
-		fd = (int)syscall(SYS_openat,
-			AT_FDCWD, "/proc/sys/vm/overcommit_memory", O_RDONLY);
-		if (fd != -1) {
-			fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-		}
-	#endif
+#if defined(O_CLOEXEC)
+	fd = malloc_open("/proc/sys/vm/overcommit_memory", O_RDONLY | O_CLOEXEC);
 #else
-	#if defined(O_CLOEXEC)
-		fd = open("/proc/sys/vm/overcommit_memory", O_RDONLY | O_CLOEXEC);
-	#else
-		fd = open("/proc/sys/vm/overcommit_memory", O_RDONLY);
-		if (fd != -1) {
-			fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
-		}
-	#endif
+	fd = malloc_open("/proc/sys/vm/overcommit_memory", O_RDONLY);
+	if (fd != -1) {
+		fcntl(fd, F_SETFD, fcntl(fd, F_GETFD) | FD_CLOEXEC);
+	}
 #endif
 
 	if (fd == -1) {
@@ -488,11 +617,7 @@ os_overcommits_proc(void) {
 	}
 
 	ssize_t nread = malloc_read_fd(fd, &buf, sizeof(buf));
-#if defined(JEMALLOC_USE_SYSCALL) && defined(SYS_close)
-	syscall(SYS_close, fd);
-#else
-	close(fd);
-#endif
+	malloc_close(fd);
 
 	if (nread < 1) {
 		return false; /* Error. */
@@ -506,71 +631,6 @@ os_overcommits_proc(void) {
 	return (buf[0] == '0' || buf[0] == '1');
 }
 #endif
-
-void
-pages_set_thp_state (void *ptr, size_t size) {
-	if (opt_thp == thp_mode_default || opt_thp == init_system_thp_mode) {
-		return;
-	}
-	assert(opt_thp != thp_mode_not_supported &&
-	    init_system_thp_mode != thp_mode_not_supported);
-
-	if (opt_thp == thp_mode_always
-	    && init_system_thp_mode != thp_mode_never) {
-		assert(init_system_thp_mode == thp_mode_default);
-		pages_huge_unaligned(ptr, size);
-	} else if (opt_thp == thp_mode_never) {
-		assert(init_system_thp_mode == thp_mode_default ||
-		    init_system_thp_mode == thp_mode_always);
-		pages_nohuge_unaligned(ptr, size);
-	}
-}
-
-static void
-init_thp_state(void) {
-	if (!have_madvise_huge) {
-		if (metadata_thp_enabled() && opt_abort) {
-			malloc_write("<jemalloc>: no MADV_HUGEPAGE support\n");
-			abort();
-		}
-		goto label_error;
-	}
-
-	static const char sys_state_madvise[] = "always [madvise] never\n";
-	static const char sys_state_always[] = "[always] madvise never\n";
-	static const char sys_state_never[] = "always madvise [never]\n";
-	char buf[sizeof(sys_state_madvise)];
-
-#if defined(JEMALLOC_USE_SYSCALL) && defined(SYS_open)
-	int fd = (int)syscall(SYS_open,
-	    "/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY);
-#else
-	int fd = open("/sys/kernel/mm/transparent_hugepage/enabled", O_RDONLY);
-#endif
-	if (fd == -1) {
-		goto label_error;
-	}
-
-	ssize_t nread = malloc_read_fd(fd, &buf, sizeof(buf));
-#if defined(JEMALLOC_USE_SYSCALL) && defined(SYS_close)
-	syscall(SYS_close, fd);
-#else
-	close(fd);
-#endif
-
-	if (strncmp(buf, sys_state_madvise, (size_t)nread) == 0) {
-		init_system_thp_mode = thp_mode_default;
-	} else if (strncmp(buf, sys_state_always, (size_t)nread) == 0) {
-		init_system_thp_mode = thp_mode_always;
-	} else if (strncmp(buf, sys_state_never, (size_t)nread) == 0) {
-		init_system_thp_mode = thp_mode_never;
-	} else {
-		goto label_error;
-	}
-	return;
-label_error:
-	opt_thp = init_system_thp_mode = thp_mode_not_supported;
-}
 
 bool
 pages_boot(void) {
@@ -587,28 +647,11 @@ pages_boot(void) {
 	mmap_flags = MAP_PRIVATE | MAP_ANON;
 #endif
 
-#if defined(__ANDROID__)
-  /* Android always supports overcommits. */
-  os_overcommits = true;
-#else  /* __ANDROID__ */
-
-#ifdef JEMALLOC_SYSCTL_VM_OVERCOMMIT
-	os_overcommits = os_overcommits_sysctl();
-#elif defined(JEMALLOC_PROC_SYS_VM_OVERCOMMIT_MEMORY)
-	os_overcommits = os_overcommits_proc();
-#  ifdef MAP_NORESERVE
-	if (os_overcommits) {
-		mmap_flags |= MAP_NORESERVE;
-	}
-#  endif
+#ifdef __FreeBSD__
+	/*
+	 * FreeBSD doesn't need the check; madvise(2) is known to work.
+	 */
 #else
-	os_overcommits = false;
-#endif
-
-#endif  /* __ANDROID__ */
-
-	init_thp_state();
-
 	/* Detect lazy purge runtime support. */
 	if (pages_can_purge_lazy) {
 		bool committed = false;
@@ -622,6 +665,7 @@ pages_boot(void) {
 		}
 		os_pages_unmap(madv_free_page, PAGE);
 	}
+#endif
 
 	return false;
 }

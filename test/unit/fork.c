@@ -1,32 +1,5 @@
 #include "test/jemalloc_test.h"
-
-#ifndef _WIN32
-#include <sys/wait.h>
-#endif
-
-#ifndef _WIN32
-static void
-wait_for_child_exit(int pid) {
-	int status;
-	while (true) {
-		if (waitpid(pid, &status, 0) == -1) {
-			test_fail("Unexpected waitpid() failure.");
-		}
-		if (WIFSIGNALED(status)) {
-			test_fail("Unexpected child termination due to "
-			    "signal %d", WTERMSIG(status));
-			break;
-		}
-		if (WIFEXITED(status)) {
-			if (WEXITSTATUS(status) != 0) {
-				test_fail("Unexpected child exit value %d",
-				    WEXITSTATUS(status));
-			}
-			break;
-		}
-	}
-}
-#endif
+#include "test/fork.h"
 
 TEST_BEGIN(test_fork) {
 #ifndef _WIN32
@@ -36,25 +9,25 @@ TEST_BEGIN(test_fork) {
 	/* Set up a manually managed arena for test. */
 	unsigned arena_ind;
 	size_t sz = sizeof(unsigned);
-	assert_d_eq(mallctl("arenas.create", (void *)&arena_ind, &sz, NULL, 0),
+	expect_d_eq(mallctl("arenas.create", (void *)&arena_ind, &sz, NULL, 0),
 	    0, "Unexpected mallctl() failure");
 
 	/* Migrate to the new arena. */
 	unsigned old_arena_ind;
 	sz = sizeof(old_arena_ind);
-	assert_d_eq(mallctl("thread.arena", (void *)&old_arena_ind, &sz,
+	expect_d_eq(mallctl("thread.arena", (void *)&old_arena_ind, &sz,
 	    (void *)&arena_ind, sizeof(arena_ind)), 0,
 	    "Unexpected mallctl() failure");
 
 	p = malloc(1);
-	assert_ptr_not_null(p, "Unexpected malloc() failure");
+	expect_ptr_not_null(p, "Unexpected malloc() failure");
 
 	pid = fork();
 
 	free(p);
 
 	p = malloc(64);
-	assert_ptr_not_null(p, "Unexpected malloc() failure");
+	expect_ptr_not_null(p, "Unexpected malloc() failure");
 	free(p);
 
 	if (pid == -1) {
@@ -64,7 +37,7 @@ TEST_BEGIN(test_fork) {
 		/* Child. */
 		_exit(0);
 	} else {
-		wait_for_child_exit(pid);
+		fork_wait_for_child_exit(pid);
 	}
 #else
 	test_skip("fork(2) is irrelevant to Windows");
@@ -87,7 +60,7 @@ do_fork_thd(void *arg) {
 		test_fail("Exec failed");
 	} else {
 		/* Parent */
-		wait_for_child_exit(pid);
+		fork_wait_for_child_exit(pid);
 	}
 	return NULL;
 }
@@ -95,7 +68,7 @@ do_fork_thd(void *arg) {
 
 #ifndef _WIN32
 static void
-do_test_fork_multithreaded() {
+do_test_fork_multithreaded(void) {
 	thd_t child;
 	thd_create(&child, do_fork_thd, NULL);
 	do_fork_thd(NULL);
@@ -124,7 +97,7 @@ TEST_BEGIN(test_fork_multithreaded) {
 			do_test_fork_multithreaded();
 			_exit(0);
 		} else {
-			wait_for_child_exit(pid);
+			fork_wait_for_child_exit(pid);
 		}
 	}
 #else

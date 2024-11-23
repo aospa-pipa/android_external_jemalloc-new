@@ -1,4 +1,3 @@
-#define JEMALLOC_RTREE_C_
 #include "jemalloc/internal/jemalloc_preamble.h"
 #include "jemalloc/internal/jemalloc_internal_includes.h"
 
@@ -10,7 +9,7 @@
  * used.
  */
 bool
-rtree_new(rtree_t *rtree, bool zeroed) {
+rtree_new(rtree_t *rtree, base_t *base, bool zeroed) {
 #ifdef JEMALLOC_JET
 	if (!zeroed) {
 		memset(rtree, 0, sizeof(rtree_t)); /* Clear root. */
@@ -18,6 +17,7 @@ rtree_new(rtree_t *rtree, bool zeroed) {
 #else
 	assert(zeroed);
 #endif
+	rtree->base = base;
 
 	if (malloc_mutex_init(&rtree->init_lock, "rtree", WITNESS_RANK_RTREE,
 	    malloc_mutex_rank_exclusive)) {
@@ -28,75 +28,16 @@ rtree_new(rtree_t *rtree, bool zeroed) {
 }
 
 static rtree_node_elm_t *
-rtree_node_alloc_impl(tsdn_t *tsdn, rtree_t *rtree, size_t nelms) {
-	return (rtree_node_elm_t *)base_alloc(tsdn, b0get(), nelms *
-	    sizeof(rtree_node_elm_t), CACHELINE);
+rtree_node_alloc(tsdn_t *tsdn, rtree_t *rtree, size_t nelms) {
+	return (rtree_node_elm_t *)base_alloc_rtree(tsdn, rtree->base,
+	    nelms * sizeof(rtree_node_elm_t));
 }
-rtree_node_alloc_t *JET_MUTABLE rtree_node_alloc = rtree_node_alloc_impl;
-
-static void
-rtree_node_dalloc_impl(tsdn_t *tsdn, rtree_t *rtree, rtree_node_elm_t *node) {
-	/* Nodes are never deleted during normal operation. */
-	not_reached();
-}
-UNUSED rtree_node_dalloc_t *JET_MUTABLE rtree_node_dalloc =
-    rtree_node_dalloc_impl;
 
 static rtree_leaf_elm_t *
-rtree_leaf_alloc_impl(tsdn_t *tsdn, rtree_t *rtree, size_t nelms) {
-	return (rtree_leaf_elm_t *)base_alloc(tsdn, b0get(), nelms *
-	    sizeof(rtree_leaf_elm_t), CACHELINE);
+rtree_leaf_alloc(tsdn_t *tsdn, rtree_t *rtree, size_t nelms) {
+	return (rtree_leaf_elm_t *)base_alloc_rtree(tsdn, rtree->base,
+	    nelms * sizeof(rtree_leaf_elm_t));
 }
-rtree_leaf_alloc_t *JET_MUTABLE rtree_leaf_alloc = rtree_leaf_alloc_impl;
-
-static void
-rtree_leaf_dalloc_impl(tsdn_t *tsdn, rtree_t *rtree, rtree_leaf_elm_t *leaf) {
-	/* Leaves are never deleted during normal operation. */
-	not_reached();
-}
-UNUSED rtree_leaf_dalloc_t *JET_MUTABLE rtree_leaf_dalloc =
-    rtree_leaf_dalloc_impl;
-
-#ifdef JEMALLOC_JET
-#  if RTREE_HEIGHT > 1
-static void
-rtree_delete_subtree(tsdn_t *tsdn, rtree_t *rtree, rtree_node_elm_t *subtree,
-    unsigned level) {
-	size_t nchildren = ZU(1) << rtree_levels[level].bits;
-	if (level + 2 < RTREE_HEIGHT) {
-		for (size_t i = 0; i < nchildren; i++) {
-			rtree_node_elm_t *node =
-			    (rtree_node_elm_t *)atomic_load_p(&subtree[i].child,
-			    ATOMIC_RELAXED);
-			if (node != NULL) {
-				rtree_delete_subtree(tsdn, rtree, node, level +
-				    1);
-			}
-		}
-	} else {
-		for (size_t i = 0; i < nchildren; i++) {
-			rtree_leaf_elm_t *leaf =
-			    (rtree_leaf_elm_t *)atomic_load_p(&subtree[i].child,
-			    ATOMIC_RELAXED);
-			if (leaf != NULL) {
-				rtree_leaf_dalloc(tsdn, rtree, leaf);
-			}
-		}
-	}
-
-	if (subtree != rtree->root) {
-		rtree_node_dalloc(tsdn, rtree, subtree);
-	}
-}
-#  endif
-
-void
-rtree_delete(tsdn_t *tsdn, rtree_t *rtree) {
-#  if RTREE_HEIGHT > 1
-	rtree_delete_subtree(tsdn, rtree, rtree->root, 0);
-#  endif
-}
-#endif
 
 static rtree_node_elm_t *
 rtree_node_init(tsdn_t *tsdn, rtree_t *rtree, unsigned level,
@@ -242,11 +183,8 @@ rtree_leaf_elm_lookup_hard(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
 
 #define RTREE_GET_CHILD(level) {					\
 		assert(level < RTREE_HEIGHT-1);				\
-		/* ANDROID CHANGE: Bad pointers return NULL */		\
-		/* if (level != 0 && !dependent && */			\
-		/*    unlikely(!rtree_node_valid(node))) { */		\
-		if (unlikely(!rtree_node_valid(node))) {		\
-		/* ANDROID END CHANGE */				\
+		if (level != 0 && !dependent &&				\
+		    unlikely(!rtree_node_valid(node))) {		\
 			return NULL;					\
 		}							\
 		uintptr_t subkey = rtree_subkey(key, level);		\
@@ -271,10 +209,7 @@ rtree_leaf_elm_lookup_hard(tsdn_t *tsdn, rtree_t *rtree, rtree_ctx_t *rtree_ctx,
 	 */
 #define RTREE_GET_LEAF(level) {						\
 		assert(level == RTREE_HEIGHT-1);			\
-		/* ANDROID CHANGE: Bad pointers return NULL */		\
-		/* if (!dependent && unlikely(!rtree_leaf_valid(leaf))) {*/	\
-		if (unlikely(!rtree_leaf_valid(leaf))) {		\
-		/* ANDROID END CHANGE */				\
+		if (!dependent && unlikely(!rtree_leaf_valid(leaf))) {	\
 			return NULL;					\
 		}							\
 		if (RTREE_CTX_NCACHE_L2 > 1) {				\
